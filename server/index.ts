@@ -19,7 +19,7 @@ console.log(`[db] بانک سوالات: ${seeded.total} سوال تأییدشد
 // ───────── سرور وب ─────────
 const app = express();
 app.disable('x-powered-by');
-app.set('trust proxy', false);
+app.set('trust proxy', 'loopback');
 
 app.use((_req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -86,12 +86,14 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   res.status(500).json({ error: { code: 'server_error', message: 'خطایی در سرور رخ داد. دوباره امتحان کن.' } });
 });
 
-const server = app.listen(config.port, () => {
-  console.log(`[http] سرور روی http://localhost:${config.port} بالا آمد.`);
+const onListen = () => {
+  const where = config.host ? `${config.host}:${config.port}` : `localhost:${config.port}`;
+  console.log(`[http] سرور روی http://${where} بالا آمد.`);
   if (config.devAuth) {
     console.warn('[http] ⚠️  DEV_AUTH فعال است: ورود بدون تلگرام با ?dev=1 ممکن است. در محیط واقعی خاموشش کنید!');
   }
-});
+};
+const server = config.host ? app.listen(config.port, config.host, onListen) : app.listen(config.port, onListen);
 
 // ───────── کارهای دوره‌ای ─────────
 const botTimer = setInterval(tickBots, 3000);

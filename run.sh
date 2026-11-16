@@ -6,7 +6,8 @@
 #   bash run.sh
 #
 # اگر Node.js 22.18 یا جدیدتر نباشد، اسکریپت آن را نصب می‌کند.
-# توکن، دامنه و بقیهٔ تنظیمات را می‌پرسد و در .env ذخیره می‌کند.
+# توکن، دامنه و بقیهٔ تنظیمات را می‌پرسد، برای دامنه گواهی SSL می‌گیرد و سرور را اجرا می‌کند.
+# رکورد A دامنه باید به آی‌پی این سرور اشاره کند.
 # برای تغییر تنظیمات بعدی: bash run.sh --config
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -50,6 +51,12 @@ env_quote() {
   value=${value//$'\n'/}
   value=${value//$'\r'/}
   printf '"%s"' "$value"
+}
+
+valid_domain() {
+  local host="$1"
+  [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]] \
+    && [[ "$host" =~ \.[A-Za-z]{2,}$ ]]
 }
 
 trim() {
@@ -107,6 +114,7 @@ configure_env() {
 
   note ""
   note "تنظیمات ربات را وارد کنید. Enter مقدار داخل براکت را نگه می‌دارد و - مقدار اختیاری را پاک می‌کند."
+  note "رکورد A دامنه باید از قبل به آی‌پی این سرور اشاره کند. گواهی SSL خودکار گرفته می‌شود."
   note ""
 
   token=$(env_get BOT_TOKEN)
@@ -127,11 +135,11 @@ configure_env() {
     url=${url#https://}
     url=${url#http://}
     url=${url%/}
-    if [[ -n "$url" && "$url" != */* && "$url" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; then
+    if valid_domain "$url"; then
       url="https://${url}"
       break
     fi
-    note "دامنه نامعتبر است. فقط نام دامنه را وارد کنید، مثلاً bot.example.com"
+    note "یک دامنهٔ واقعی وارد کنید، مثلاً bot.example.com. آی‌پی قبول نمی‌شود؛ SSL روی پورت ۴۴۳ گرفته می‌شود."
     url=""
   done
 
@@ -155,6 +163,17 @@ configure_env() {
     fi
     note "فقط عدد تلگرام، و اگر چند نفر هستند با ویرگول جدا کنید."
     admins=""
+  done
+
+  local email
+  email=$(env_get LETSENCRYPT_EMAIL)
+  while true; do
+    email=$(ask_line "ایمیل برای گواهی SSL (Enter بدون ایمیل)" "$email")
+    if [[ -z "$email" || "$email" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
+      break
+    fi
+    note "ایمیل نامعتبر است."
+    email=""
   done
 
   miniapp=$(ask_bool "Main Mini App در BotFather فعال است؟" "$(env_get MAIN_MINIAPP)")
@@ -185,6 +204,7 @@ configure_env() {
 # تنظیمات ربات «بلد باش» — ساخته‌شده با run.sh
 BOT_TOKEN=$(env_quote "$token")
 WEBAPP_URL=$(env_quote "$url")
+LETSENCRYPT_EMAIL=$(env_quote "$email")
 PORT=$(env_quote "$port")
 ADMIN_IDS=$(env_quote "$admins")
 MAIN_MINIAPP=$(env_quote "$miniapp")
@@ -308,6 +328,140 @@ install_node() {
   export PATH="/usr/local/bin:${HOME}/.local/bin:${PATH}"
 }
 
+webapp_domain() {
+  local host
+  host=$(env_get WEBAPP_URL)
+  host=${host#https://}
+  host=${host#http://}
+  host=${host%%/*}
+  host=${host%:443}
+  if ! valid_domain "$host"; then
+    note "برای SSL یک دامنهٔ معتبر لازم است. با bash run.sh --config دامنه را اصلاح کنید."
+    return 1
+  fi
+  printf '%s' "$host"
+}
+
+setup_https() {
+  local domain port public_ip dns_ips email conf listen6
+  domain=$(webapp_domain) || exit 1
+  port=$(env_get PORT)
+  port=${port:-3000}
+
+  if [[ "$(id -u)" -ne 0 ]] && ! need_cmd sudo; then
+    log "برای گرفتن SSL اسکریپت را با root یا sudo اجرا کنید."
+    exit 1
+  fi
+
+  if ! need_cmd curl; then
+    install_os_packages
+  fi
+
+  log "بررسی اینکه ${domain} به این سرور اشاره کند..."
+  public_ip=$(curl -4 -fsSL --max-time 15 https://api.ipify.org || true)
+  public_ip=$(trim "$public_ip")
+  dns_ips=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u || true)
+  if [[ -z "$dns_ips" ]]; then
+    log "دامنهٔ ${domain} هنوز به هیچ آی‌پی‌ای اشاره نمی‌کند."
+    [[ -n "$public_ip" ]] && log "رکورد A را به آی‌پی ${public_ip} بدهید و دوباره bash run.sh را اجرا کنید."
+    exit 1
+  fi
+  if [[ -n "$public_ip" ]] && ! printf '%s\n' "$dns_ips" | grep -qx "$public_ip"; then
+    log "رکورد A دامنهٔ ${domain} به این سرور اشاره نمی‌کند."
+    log "آی‌پی سرور: ${public_ip}"
+    log "آی‌پی دامنه: $(printf '%s' "$dns_ips" | tr '\n' ' ')"
+    log "رکورد را اصلاح کنید. اگر Cloudflare روشن است، پروکسی را خاموش کنید تا دامنه مستقیم به این سرور برسد."
+    exit 1
+  fi
+
+  if ! need_cmd nginx || ! need_cmd certbot || ! certbot plugins 2>/dev/null | grep -q nginx; then
+    log "نصب Nginx و Certbot..."
+    if need_cmd apt-get; then
+      as_root env DEBIAN_FRONTEND=noninteractive apt-get update -y
+      as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y nginx certbot python3-certbot-nginx
+    elif need_cmd dnf; then
+      as_root dnf install -y nginx certbot python3-certbot-nginx
+    elif need_cmd yum; then
+      as_root yum install -y epel-release || true
+      as_root yum install -y nginx certbot python3-certbot-nginx
+    else
+      log "نصب خودکار SSL روی این توزیع پشتیبانی نمی‌شود. apt یا dnf لازم است."
+      exit 1
+    fi
+    hash -r || true
+  fi
+
+  if need_cmd ufw && as_root ufw status 2>/dev/null | grep -q "Status: active"; then
+    as_root ufw allow 80/tcp
+    as_root ufw allow 443/tcp
+  fi
+
+  listen6=""
+  if [[ -f /proc/net/if_inet6 ]]; then
+    listen6=$'\n    listen [::]:80;'
+  fi
+
+  if [[ -d /etc/nginx/sites-available ]]; then
+    conf=/etc/nginx/sites-available/baladbash
+  else
+    as_root mkdir -p /etc/nginx/conf.d
+    conf=/etc/nginx/conf.d/baladbash.conf
+  fi
+
+  log "تنظیم Nginx برای ${domain}..."
+  as_root tee "$conf" >/dev/null <<EOF
+server {
+    listen 80;${listen6}
+    server_name ${domain};
+
+    location / {
+        proxy_pass http://127.0.0.1:${port};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+
+  if [[ -d /etc/nginx/sites-enabled ]]; then
+    as_root ln -sfn "$conf" /etc/nginx/sites-enabled/baladbash
+    as_root rm -f /etc/nginx/sites-enabled/default
+  fi
+
+  as_root nginx -t
+  if need_cmd systemctl; then
+    as_root systemctl enable nginx
+    if as_root systemctl is-active --quiet nginx; then
+      as_root systemctl reload nginx
+    else
+      as_root systemctl restart nginx
+    fi
+  else
+    as_root nginx -s reload 2>/dev/null || as_root nginx
+  fi
+
+  log "گرفتن گواهی SSL از Let's Encrypt. پورت‌های ۸۰ و ۴۴۳ باید از اینترنت باز باشند..."
+  email=$(env_get LETSENCRYPT_EMAIL)
+  if [[ -n "$email" ]]; then
+    as_root certbot --nginx -d "$domain" --non-interactive --agree-tos --redirect --keep-until-expiring -m "$email" --no-eff-email
+  else
+    as_root certbot --nginx -d "$domain" --non-interactive --agree-tos --redirect --keep-until-expiring --register-unsafely-without-email
+  fi
+
+  if need_cmd systemctl; then
+    as_root systemctl enable --now certbot.timer >/dev/null 2>&1 || true
+    as_root systemctl reload nginx
+  fi
+
+  if [[ ! -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]]; then
+    log "گواهی SSL ساخته نشد."
+    exit 1
+  fi
+  log "SSL آماده است: https://${domain}"
+}
+
 if [[ "$(uname -s)" != "Linux" ]]; then
   log "این اسکریپت برای سرور لینوکس است."
   exit 1
@@ -327,6 +481,7 @@ if ! node_is_ready; then
   exit 1
 fi
 
+setup_https
 mkdir -p data
 
 log "نصب وابستگی‌های پروژه..."
@@ -335,5 +490,7 @@ npm ci --include=dev
 log "ساخت مینی‌اپ..."
 npm run build
 
-log "سرور بالا می‌آید. برای توقف Ctrl+C بزنید."
+log "سرور بالا می‌آید. آدرس عمومی: $(env_get WEBAPP_URL)"
+log "برای توقف Ctrl+C بزنید."
+export HOST=127.0.0.1
 exec npm start

@@ -20,6 +20,8 @@ function bool(name: string): boolean {
 
 export const config = {
   port: num('PORT', 3000),
+  /** اگر خالی باشد روی همهٔ رابط‌ها گوش می‌دهد. run.sh مقدار 127.0.0.1 می‌گذارد. */
+  host: (env.HOST ?? '').trim(),
   botToken: (env.BOT_TOKEN ?? '').trim(),
   webAppUrl: (env.WEBAPP_URL ?? '').trim().replace(/\/+$/, ''),
   adminIds: (env.ADMIN_IDS ?? '')
