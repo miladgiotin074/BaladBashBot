@@ -6,7 +6,8 @@
 #   bash run.sh
 #
 # اگر Node.js 22.18 یا جدیدتر نباشد، اسکریپت آن را نصب می‌کند.
-# توکن، دامنه و بقیهٔ تنظیمات را می‌پرسد، برای دامنه گواهی SSL می‌گیرد و سرور را اجرا می‌کند.
+# توکن، دامنه و بقیهٔ تنظیمات را می‌پرسد، برای دامنه گواهی SSL می‌گیرد
+# و اپ را به‌صورت سرویس systemd اجرا می‌کند تا با بستن ترمینال قطع نشود.
 # رکورد A دامنه باید به آی‌پی این سرور اشاره کند.
 # برای تغییر تنظیمات بعدی: bash run.sh --config
 set -euo pipefail
@@ -462,6 +463,75 @@ EOF
   log "SSL آماده است: https://${domain}"
 }
 
+install_service() {
+  local app_dir node_bin unit port pids pid
+  app_dir=$(pwd)
+  node_bin=$(command -v node)
+  unit=/etc/systemd/system/baladbash.service
+  port=$(env_get PORT)
+  port=${port:-3000}
+
+  if ! need_cmd systemctl; then
+    log "systemd روی این سرور پیدا نشد. سرویس ساخته نمی‌شود."
+    exit 1
+  fi
+
+  if need_cmd ss; then
+    local service_pid
+    service_pid=$(systemctl show -p MainPID --value baladbash 2>/dev/null || true)
+    pids=$(ss -ltnp "sport = :${port}" 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | sort -u || true)
+    if [[ -n "$pids" ]]; then
+      log "پورت ${port} اشغال است. فرایند قبلی بسته می‌شود تا سرویس جای آن را بگیرد."
+      for pid in $pids; do
+        if [[ "$pid" == "0" || "$pid" == "$service_pid" ]]; then
+          continue
+        fi
+        if [[ -r "/proc/${pid}/cmdline" ]] && tr '\0' ' ' < "/proc/${pid}/cmdline" | grep -q nginx; then
+          continue
+        fi
+        kill "$pid" 2>/dev/null || as_root kill "$pid" 2>/dev/null || true
+      done
+      sleep 1
+    fi
+  fi
+
+  log "ساخت سرویس baladbash..."
+  as_root tee "$unit" >/dev/null <<EOF
+[Unit]
+Description=Balad Bash Telegram bot
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=${app_dir}
+ExecStart="${node_bin}" server/index.ts
+Environment=HOST=127.0.0.1
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  as_root systemctl daemon-reload
+  as_root systemctl enable baladbash
+  as_root systemctl restart baladbash
+  sleep 2
+
+  if ! as_root systemctl is-active --quiet baladbash; then
+    log "سرویس بالا نیامد. آخرین لاگ:"
+    as_root journalctl -u baladbash -n 40 --no-pager || true
+    exit 1
+  fi
+
+  log "سرویس baladbash فعال است و با بستن ترمینال قطع نمی‌شود."
+  log "آدرس عمومی: $(env_get WEBAPP_URL)"
+  log "وضعیت: systemctl status baladbash"
+  log "لاگ: journalctl -u baladbash -f"
+}
+
 if [[ "$(uname -s)" != "Linux" ]]; then
   log "این اسکریپت برای سرور لینوکس است."
   exit 1
@@ -490,7 +560,4 @@ npm ci --include=dev
 log "ساخت مینی‌اپ..."
 npm run build
 
-log "سرور بالا می‌آید. آدرس عمومی: $(env_get WEBAPP_URL)"
-log "برای توقف Ctrl+C بزنید."
-export HOST=127.0.0.1
-exec npm start
+install_service
