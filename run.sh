@@ -6,14 +6,199 @@
 #   bash run.sh
 #
 # اگر Node.js 22.18 یا جدیدتر نباشد، اسکریپت آن را نصب می‌کند.
-# بار اول .env را می‌سازد؛ BOT_TOKEN و WEBAPP_URL را پر کنید و دوباره اجرا کنید.
+# توکن، دامنه و بقیهٔ تنظیمات را می‌پرسد و در .env ذخیره می‌کند.
+# برای تغییر تنظیمات بعدی: bash run.sh --config
 set -euo pipefail
 cd "$(dirname "$0")"
 
 export PATH="/usr/local/bin:${HOME}/.local/bin:${PATH}"
 
+RECONFIG=false
+if [[ "${1:-}" == "--config" ]]; then
+  RECONFIG=true
+fi
+
 log() {
   printf '%s\n' "$*"
+}
+
+note() {
+  printf '%s\n' "$*" >&2
+}
+
+env_get() {
+  local key="$1" line
+  [[ -f .env ]] || return 0
+  line=$(grep -E "^${key}=" .env | tail -n 1 || true)
+  [[ -n "$line" ]] || return 0
+  line=${line#"${key}="}
+  line=${line%$'\r'}
+  if [[ ${line:0:1} == '"' && ${line: -1} == '"' ]]; then
+    line=${line:1:${#line}-2}
+    line=${line//\\\"/\"}
+    line=${line//\\\\/\\}
+  elif [[ ${line:0:1} == "'" && ${line: -1} == "'" ]]; then
+    line=${line:1:${#line}-2}
+  fi
+  printf '%s' "$line"
+}
+
+env_quote() {
+  local value="$1"
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\n'/}
+  value=${value//$'\r'/}
+  printf '"%s"' "$value"
+}
+
+trim() {
+  local value="$1"
+  value=${value#"${value%%[![:space:]]*}"}
+  value=${value%"${value##*[![:space:]]}"}
+  printf '%s' "$value"
+}
+
+ask_line() {
+  local label="$1" default="${2:-}" value
+  if [[ -n "$default" ]]; then
+    read -r -p "${label} [${default}]: " value
+  else
+    read -r -p "${label}: " value
+  fi
+  value=$(trim "${value:-$default}")
+  if [[ "$value" == "-" ]]; then
+    value=""
+  fi
+  printf '%s' "$value"
+}
+
+ask_bool() {
+  local label="$1" default="${2:-false}" hint="y/N" value
+  [[ "$default" == "true" ]] && hint="Y/n"
+  read -r -p "${label} [${hint}]: " value
+  value=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
+  case "$(trim "$value")" in
+    y | yes | true | 1 | بله) printf 'true' ;;
+    n | no | false | 0 | خیر) printf 'false' ;;
+    *) printf '%s' "$default" ;;
+  esac
+}
+
+config_is_ready() {
+  local token url
+  token=$(env_get BOT_TOKEN)
+  url=$(env_get WEBAPP_URL)
+  [[ -n "$token" && "$url" == https://* ]]
+}
+
+configure_env() {
+  local token url port admins miniapp stars proxy delay hours dbpath apiroot
+
+  if [[ "$RECONFIG" != true ]] && config_is_ready; then
+    log "تنظیمات .env موجود است. برای تغییر: bash run.sh --config"
+    return 0
+  fi
+
+  if [[ ! -t 0 ]]; then
+    log "توکن و دامنه داخل .env نیست و این اجرا ترمینال تعاملی ندارد."
+    exit 1
+  fi
+
+  note ""
+  note "تنظیمات ربات را وارد کنید. Enter مقدار داخل براکت را نگه می‌دارد و - مقدار اختیاری را پاک می‌کند."
+  note ""
+
+  token=$(env_get BOT_TOKEN)
+  while true; do
+    token=$(ask_line "توکن ربات از @BotFather" "$token")
+    if [[ ${#token} -ge 30 && "$token" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
+      break
+    fi
+    note "توکن نامعتبر است. نمونه: 123456789:AA... از @BotFather"
+    token=""
+  done
+
+  url=$(env_get WEBAPP_URL)
+  url=${url#https://}
+  url=${url#http://}
+  while true; do
+    url=$(ask_line "دامنهٔ عمومی مینی‌اپ (مثال bot.example.com)" "$url")
+    url=${url#https://}
+    url=${url#http://}
+    url=${url%/}
+    if [[ -n "$url" && "$url" != */* && "$url" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; then
+      url="https://${url}"
+      break
+    fi
+    note "دامنه نامعتبر است. فقط نام دامنه را وارد کنید، مثلاً bot.example.com"
+    url=""
+  done
+
+  port=$(env_get PORT)
+  port=${port:-3000}
+  while true; do
+    port=$(ask_line "پورت داخلی سرور" "$port")
+    if [[ "$port" =~ ^[0-9]+$ ]] && ((10#$port >= 1 && 10#$port <= 65535)); then
+      break
+    fi
+    note "پورت باید عددی بین ۱ و ۶۵۵۳۵ باشد."
+    port="3000"
+  done
+
+  admins=$(env_get ADMIN_IDS)
+  while true; do
+    admins=$(ask_line "شناسهٔ عددی ادمین‌ها، با ویرگول (اختیاری)" "$admins")
+    admins=${admins// /}
+    if [[ -z "$admins" || "$admins" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+      break
+    fi
+    note "فقط عدد تلگرام، و اگر چند نفر هستند با ویرگول جدا کنید."
+    admins=""
+  done
+
+  miniapp=$(ask_bool "Main Mini App در BotFather فعال است؟" "$(env_get MAIN_MINIAPP)")
+  [[ -z "$miniapp" ]] && miniapp=false
+  stars=$(ask_bool "فروش سکه با ستارهٔ تلگرام فعال باشد؟" "$(env_get STARS_SHOP)")
+  [[ -z "$stars" ]] && stars=false
+  proxy=$(env_get PROXY_URL)
+  while true; do
+    proxy=$(ask_line "پروکسی تلگرام، اگر لازم است (مثال socks5://127.0.0.1:1080)" "$proxy")
+    if [[ -z "$proxy" || "$proxy" =~ ^(https?|socks5?)://[^[:space:]]+$ ]]; then
+      break
+    fi
+    note "پروکسی نامعتبر است. خالی بگذارید یا آدرسی مثل socks5://127.0.0.1:1080 وارد کنید."
+    proxy=""
+  done
+
+  delay=$(env_get BOT_JOIN_DELAY_SEC)
+  delay=${delay:-20}
+  hours=$(env_get TURN_TIMEOUT_HOURS)
+  hours=${hours:-24}
+  dbpath=$(env_get DB_PATH)
+  dbpath=${dbpath:-./data/baladbash.db}
+  apiroot=$(env_get TELEGRAM_API_ROOT)
+
+  local tmp
+  tmp=$(mktemp)
+  cat > "$tmp" <<EOF
+# تنظیمات ربات «بلد باش» — ساخته‌شده با run.sh
+BOT_TOKEN=$(env_quote "$token")
+WEBAPP_URL=$(env_quote "$url")
+PORT=$(env_quote "$port")
+ADMIN_IDS=$(env_quote "$admins")
+MAIN_MINIAPP=$(env_quote "$miniapp")
+STARS_SHOP=$(env_quote "$stars")
+BOT_JOIN_DELAY_SEC=$(env_quote "$delay")
+TURN_TIMEOUT_HOURS=$(env_quote "$hours")
+DB_PATH=$(env_quote "$dbpath")
+PROXY_URL=$(env_quote "$proxy")
+TELEGRAM_API_ROOT=$(env_quote "$apiroot")
+DEV_AUTH="false"
+EOF
+  mv "$tmp" .env
+  chmod 600 .env
+  log "تنظیمات در .env ذخیره شد. آدرس مینی‌اپ: ${url}"
 }
 
 need_cmd() {
@@ -128,6 +313,8 @@ if [[ "$(uname -s)" != "Linux" ]]; then
   exit 1
 fi
 
+configure_env
+
 if node_is_ready; then
   log "Node.js $(node -v) از قبل آماده است."
 else
@@ -142,25 +329,11 @@ fi
 
 mkdir -p data
 
-if [[ ! -f .env ]]; then
-  cp .env.example .env
-  log "فایل .env ساخته شد."
-fi
-
 log "نصب وابستگی‌های پروژه..."
 npm ci --include=dev
 
 log "ساخت مینی‌اپ..."
 npm run build
-
-if ! grep -qE '^BOT_TOKEN=.+' .env; then
-  log "همهٔ پیش‌نیازها آماده‌اند. توکن را از @BotFather در BOT_TOKEN داخل .env بگذارید و دوباره bash run.sh را اجرا کنید."
-  exit 1
-fi
-
-if ! grep -qE '^WEBAPP_URL=https://.+' .env; then
-  log "هشدار: WEBAPP_URL باید یک آدرس https عمومی باشد تا دکمه‌های مینی‌اپ در تلگرام کار کنند."
-fi
 
 log "سرور بالا می‌آید. برای توقف Ctrl+C بزنید."
 exec npm start
